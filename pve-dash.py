@@ -89,6 +89,68 @@ def read_temp():
     return best
 
 
+_disk_cache = {"t": 0, "data": []}
+
+
+def read_meminfo():
+    """Detailed host memory from /proc/meminfo (bytes)."""
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024
+    except Exception:
+        return {}
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", 0)
+    return {
+        "total": total,
+        "used": total - avail,
+        "available": avail,
+        "free": info.get("MemFree", 0),
+        "cached": info.get("Cached", 0) + info.get("SReclaimable", 0),
+        "buffers": info.get("Buffers", 0),
+        "swap_total": info.get("SwapTotal", 0),
+        "swap_used": info.get("SwapTotal", 0) - info.get("SwapFree", 0),
+    }
+
+
+def read_disks():
+    """Per-drive temperature + health via smartctl. Cached 30s; does not wake sleeping HDDs."""
+    if time.time() - _disk_cache["t"] < 30:
+        return _disk_cache["data"]
+    disks = []
+    try:
+        scan = subprocess.run(["smartctl", "--scan", "-j"],
+                              capture_output=True, text=True, timeout=10)
+        devs = json.loads(scan.stdout).get("devices", [])
+    except Exception:
+        devs = []
+    for d in devs:
+        name = d.get("name", "")
+        if not name or "loop" in name:
+            continue
+        entry = {"dev": name, "model": None, "size": None, "temp": None,
+                 "health": None, "hours": None, "standby": False}
+        try:
+            r = subprocess.run(["smartctl", "-j", "-iAH", "-n", "standby", name],
+                               capture_output=True, text=True, timeout=20)
+            j = json.loads(r.stdout)
+            entry["model"] = j.get("model_name") or j.get("device", {}).get("name")
+            entry["size"] = j.get("user_capacity", {}).get("bytes")
+            entry["temp"] = j.get("temperature", {}).get("current")
+            entry["health"] = j.get("smart_status", {}).get("passed")
+            entry["hours"] = j.get("power_on_time", {}).get("hours")
+            if entry["temp"] is None and "standby" in r.stdout.lower():
+                entry["standby"] = True
+        except Exception:
+            pass
+        disks.append(entry)
+    _disk_cache.update({"t": time.time(), "data": disks})
+    return disks
+
+
 def default_host():
     # Host the browser used is injected client-side; this is only a fallback.
     return None
@@ -126,6 +188,7 @@ def build_status():
     except Exception as e:
         host["error"] = str(e)
     host["temp"] = read_temp()
+    host["mem"] = read_meminfo()
 
     storages = []
     for r in resources:
@@ -184,13 +247,24 @@ def build_status():
         "time": int(time.time()),
         "host": host,
         "storages": storages,
+        "disks": read_disks(),
         "guests": guests,
     }
 
 
+def refresh_seconds():
+    """Page refresh interval from config (default 5s, min 1s, max 60s)."""
+    try:
+        v = float(load_config().get("refresh_seconds", 5))
+    except (TypeError, ValueError):
+        v = 5.0
+    return min(60.0, max(1.0, v))
+
+
 def get_status():
+    ttl = min(3.0, refresh_seconds() / 2)  # cache half an interval, max 3s
     with _lock:
-        if time.time() - _cache["t"] > 3 or _cache["data"] is None:
+        if time.time() - _cache["t"] > ttl or _cache["data"] is None:
             try:
                 _cache["data"] = build_status()
             except Exception as e:
@@ -228,6 +302,8 @@ a.card:hover{border-color:var(--ac);transform:translateY(-1px)}
 <main><div id="err"></div>
 <h2>Host hardware</h2><div class="grid" id="host"></div>
 <h2>Storage</h2><div class="grid" id="stor"></div>
+<h2>Drives (SMART temperature &amp; health)</h2><div class="grid" id="disks"></div>
+<h2>Memory details</h2><div class="grid" id="mem"></div>
 <h2 id="gh">Containers &amp; VMs</h2><div class="grid" id="guests"></div></main>
 <script>
 const $=id=>document.getElementById(id);
@@ -249,25 +325,41 @@ async function tick(){
     $('err').innerHTML='';$('title').textContent=d.title;document.title=d.title+' Dashboard';
     const h=d.host;
     $('sub').textContent=`${h.node} · PVE ${h.pve||''} · kernel ${h.kernel||''}`;
-    const cpu=Math.round((h.cpu||0)*100);
+    const cpu=(h.cpu||0)*100;
     $('host').innerHTML=
       stat('Uptime',up(h.uptime))+
-      stat(`CPU (${h.cpu_cores||'?'} cores)`,cpu+'%',cpu)+
+      stat(`CPU (${h.cpu_cores||'?'} cores)`,cpu.toFixed(1)+'%',cpu)+
       stat('Memory',`${gb(h.mem_used)} / ${gb(h.mem_total)}`,pct(h.mem_used,h.mem_total))+
       stat('Root disk',`${gb(h.disk_used)} / ${gb(h.disk_total)}`,pct(h.disk_used,h.disk_total))+
       stat('Temperature',h.temp==null?'n/a':h.temp.toFixed(0)+' °C',h.temp==null?null:Math.min(100,h.temp))+
       stat('Load avg',(h.load||[]).join(' / ')||'-',null)+
       (h.cpu_model?`<div class="card"><div class="meta">CPU model</div><div>${h.cpu_model}</div></div>`:'');
     $('stor').innerHTML=d.storages.map(s=>stat(s.name+' ('+s.status+')',`${gb(s.used)} / ${gb(s.total)}`,pct(s.used,s.total))).join('');
+    const m=h.mem||{};
+    $('mem').innerHTML=
+      stat('Used',gb(m.used),pct(m.used,m.total))+
+      stat('Available',gb(m.available),null)+
+      stat('Cache + buffers',gb((m.cached||0)+(m.buffers||0)),null)+
+      stat('Free (unused)',gb(m.free),null)+
+      stat('Swap',`${gb(m.swap_used)} / ${gb(m.swap_total)}`,m.swap_total?pct(m.swap_used,m.swap_total):null);
+    $('disks').innerHTML=(d.disks||[]).map(k=>{
+      const t=k.temp,tc=t==null?'':t>=70?'crit':t>=55?'hi':'';
+      const ok=k.health===true?'Healthy':k.health===false?'FAILING - check drive':'';
+      return `<div class="card"><div class="row"><div class="name">${k.dev}</div><span class="badge">${k.size?gb(k.size):''}</span></div>
+        <div class="meta">${k.model||'unknown model'}</div>
+        <div class="big">${k.standby?'Standby (asleep)':t==null?'n/a':t+' °C'}</div>
+        ${t==null?'':`<div class="bar"><i class="${tc}" style="width:${Math.min(100,t)}%"></i></div>`}
+        <div class="meta">${ok}${k.hours!=null?' · '+Math.round(k.hours/24)+' days powered on':''}</div></div>`;
+    }).join('')||'<div class="card"><div class="meta">No SMART data found (is smartmontools installed?)</div></div>';
     const run=d.guests.filter(g=>g.status==='running').length;
     $('gh').textContent=`Containers & VMs — ${run} running / ${d.guests.length} total`;
     $('guests').innerHTML=d.guests.map(g=>{
       const on=g.status==='running',u=on?url(g):null;
-      const cp=Math.round((g.cpu||0)*100),mp=pct(g.mem,g.maxmem);
+      const cp=(g.cpu||0)*100,mp=pct(g.mem,g.maxmem);
       const inner=`<div class="row"><div class="name"><span class="dot ${on?'on':''}"></span>${g.name}</div>
         <span class="badge">${g.type==='lxc'?'LXC':'VM'} ${g.vmid}</span></div>
         <div class="meta">${on?'Up '+up(g.uptime):'Stopped'}${g.ip?' · '+g.ip:''}</div>
-        ${on?`<div class="lbl"><span>CPU</span><span>${cp}%</span></div>${bar(cp)}
+        ${on?`<div class="lbl"><span>CPU</span><span>${cp.toFixed(1)}%</span></div>${bar(cp)}
         <div class="lbl"><span>RAM</span><span>${gb(g.mem)} / ${gb(g.maxmem)}</span></div>${bar(mp)}`:''}
         ${u?`<div class="link">↗ ${u}</div>`:''}`;
       return u?`<a class="card" href="${u}" target="_blank" rel="noopener">${inner}</a>`:`<div class="card ${on?'':'off'}">${inner}</div>`;
@@ -275,7 +367,7 @@ async function tick(){
     $('upd').textContent='Updated '+new Date(d.time*1000).toLocaleTimeString();
   }catch(e){$('err').innerHTML='<div class="err">Cannot reach dashboard API: '+e+'</div>'}
 }
-tick();setInterval(tick,5000);
+tick();setInterval(tick,__REFRESH_MS__);
 </script></body></html>
 """
 
@@ -292,7 +384,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
-            self._send(200, HTML.encode(), "text/html; charset=utf-8")
+            page = HTML.replace("__REFRESH_MS__", str(int(refresh_seconds() * 1000)))
+            self._send(200, page.encode(), "text/html; charset=utf-8")
         elif path == "/api/status":
             self._send(200, json.dumps(get_status()).encode(), "application/json")
         elif path == "/health":

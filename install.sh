@@ -32,6 +32,8 @@ fi
 command -v pvesh >/dev/null 2>&1 || die "pvesh not found - this must run on a Proxmox VE host, not inside a container."
 command -v python3 >/dev/null 2>&1 || { say "Installing python3"; apt-get update -qq && apt-get install -y -qq python3; }
 
+command -v smartctl >/dev/null 2>&1 || { say "Installing smartmontools (for drive temperatures)"; apt-get update -qq && apt-get install -y -qq smartmontools; }
+
 mkdir -p "${INSTALL_DIR}" "${CONF_DIR}"
 
 say "Downloading pve-dash.py"
@@ -44,11 +46,26 @@ if [ ! -f "${CONF_DIR}/config.json" ]; then
   cat > "${CONF_DIR}/config.json" <<'EOF'
 {
   "title": "Homelab",
+  "refresh_seconds": 2,
   "hide": [],
   "default_ports": {},
   "overrides": {}
 }
 EOF
+fi
+
+# Optional: PVEDASH_REFRESH=<seconds> sets the live-refresh speed (also on re-install)
+if [ -n "${PVEDASH_REFRESH:-}" ]; then
+  say "Setting refresh to ${PVEDASH_REFRESH}s"
+  python3 - "${CONF_DIR}/config.json" "${PVEDASH_REFRESH}" <<'PY'
+import json, sys
+path, val = sys.argv[1], float(sys.argv[2])
+with open(path) as f:
+    cfg = json.load(f)
+cfg["refresh_seconds"] = val
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PY
 fi
 
 say "Creating systemd service"

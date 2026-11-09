@@ -4,6 +4,9 @@ A tiny, dependency-free homelab dashboard for **Proxmox VE**. One page showing:
 
 - Host hardware: uptime, CPU, RAM, root disk, temperature, load
 - Storage pools
+- Drive temperature and SMART health for every disk (NVMe and HDD; sleeping HDDs are not woken up)
+- Detailed memory: used, available, cache, free, swap
+- CPU shown with one decimal (idle containers show e.g. 0.3%, not 0%)
 - Every LXC container and VM: running/stopped, **uptime**, CPU/RAM, IP
 - Every running guest is a **clickable card** that opens its web UI
 
@@ -30,11 +33,23 @@ Easiest: add **tags** to the container in the Proxmox UI (Summary → Tags):
 
 No tag? The card links to `http://<ip>` (port 80).
 
+## Live refresh speed
+
+The page updates itself (no manual refresh). Default is every **2 seconds** (minimum 1, maximum 60).
+Set it at install time, or any time later:
+
+```bash
+PVEDASH_REFRESH=5 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jeffrey-lucero/pve-dash/main/install.sh)"
+```
+
+Or edit `"refresh_seconds"` in `/etc/pve-dash/config.json` and run `systemctl restart pve-dash`.
+
 Or edit `/etc/pve-dash/config.json` (then `systemctl restart pve-dash`):
 
 ```json
 {
   "title": "My Homelab",
+  "refresh_seconds": 2,
   "hide": [100],
   "default_ports": { "101": 8096 },
   "overrides": {
